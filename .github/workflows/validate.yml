@@ -20,5 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: hacs/action@main
+        # continue-on-error: the "brands" check only matters for submitting
+        # to the default HACS store (requires an icon merged into
+        # home-assistant/brands); it's not required to use this repo as a
+        # HACS custom repository, and would otherwise fail on every run.
+        continue-on-error: true
         with:
           category: integration

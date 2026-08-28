@@ -106,7 +106,10 @@ is removed/reloaded.
 ### Via HACS (custom repository)
 
 This integration isn't in the default HACS store, so add it as a custom
-repository:
+repository. (The `brands` check in CI is intentionally non-blocking: it
+only matters for submitting to the default store, which requires an icon
+merged into [home-assistant/brands](https://github.com/home-assistant/brands)
+- not needed to use this repo as a custom repository.)
 
 1. In Home Assistant, go to **HACS > Integrations**, open the **⋮** menu
    in the top right, and choose **Custom repositories**.
