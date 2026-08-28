@@ -7,6 +7,6 @@
   "integration_type": "hub",
   "iot_class": "calculated",
   "issue_tracker": "https://github.com/Dead96/ezviz-stream-ha-integration/issues",
-  "requirements": ["pyezvizapi>=1.0.5.0"],
-  "version": "0.1.0"
+  "requirements": ["pycryptodome>=3.19.0", "requests>=2.31.0", "paho-mqtt>=1.6.0", "xmltodict>=0.13.0"],
+  "version": "0.2.0"
 }

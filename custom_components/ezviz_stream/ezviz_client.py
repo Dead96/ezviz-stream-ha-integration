@@ -3,41 +3,42 @@
 This device (a battery-powered "peephole"/cat-eye camera) doesn't expose
 RTSP at all - confirmed by `localRtspPort`/`netRtspPort` being 0 in its own
 EZVIZ connection metadata. It only streams through EZVIZ's cloud VTM relay
-(a proprietary `ysproto` TCP protocol). We don't reimplement that protocol
-ourselves: we depend on `pyezvizapi` (the same library the official EZVIZ
-Home Assistant integration uses for login/device management), which also
-ships a `stream proxy` CLI helper that speaks VTM, remuxes it with ffmpeg,
-and re-serves it as plain HTTP MPEG-TS - something HA's stream component
-can open directly as a `stream_source()`.
+(a proprietary `ysproto` TCP protocol).
 
-Verified manually against this exact device: a `pyezvizapi` login (v5,
-MD5-hashed password) followed by pulling the VTM cloud stream returned real
-live video bytes.
+We don't reimplement that protocol ourselves: we vendor the relevant parts
+of `pyezvizapi` (github.com/RenierM26/pyEzvizApi, Apache-2.0 - see
+`vendor/pyezvizapi/`), which can speak VTM and remux it with `ffmpeg` into
+plain MPEG-TS bytes. This is vendored rather than declared as a pip
+requirement because the login/cloud-stream helpers used here live on the
+project's `main` branch but haven't made it into the version currently
+published on PyPI.
 
 Everything here only runs when a client actually asks for the stream:
-login and the proxy subprocess are both started lazily, the first time
-`async_get_stream_url()` is called - never on a timer.
+login happens lazily on the first `async_get_stream_url()` call, and the
+actual EZVIZ connection is only opened once someone GETs the HTTP view
+below - never on a timer, never in the background.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
-import sys
+import threading
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from aiohttp import web
+from homeassistant.components.http import HomeAssistantView
+from homeassistant.components.http.auth import async_sign_path
 from homeassistant.core import HomeAssistant
+
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Loopback-only: the proxy's stream URL carries no auth of its own.
-PROXY_LISTEN_HOST = "127.0.0.1"
-_PROXY_PORT_BASE = 8558
-_PROXY_PORT_RANGE = 100
-_PROXY_READY_TIMEOUT = 5.0
+_SIGNED_URL_EXPIRATION = timedelta(minutes=5)
 
 
 class EzvizAuthError(Exception):
@@ -45,7 +46,7 @@ class EzvizAuthError(Exception):
 
 
 class EzvizClient:
-    """Manages an EZVIZ login session and one on-demand stream proxy per device."""
+    """Manages one EZVIZ login session for a config entry."""
 
     def __init__(
         self,
@@ -54,87 +55,65 @@ class EzvizClient:
         password: str,
         token_path: Path,
     ) -> None:
-        """Initialize the client. No network I/O or subprocess happens here."""
+        """Initialize the client. No network I/O happens here."""
         self._hass = hass
         self._account = account
         self._password = password
         self._token_path = token_path
 
-        self._client: Any | None = None  # pyezvizapi.client.EzvizClient, once logged in
-        self._proxy_processes: dict[str, asyncio.subprocess.Process] = {}
-        self._proxy_ports: dict[str, int] = {}
-        self._lock = asyncio.Lock()
+        self._client: Any | None = None  # vendored pyezvizapi.client.EzvizClient
+        self._login_lock = asyncio.Lock()
 
-    async def async_get_stream_url(self, serial: str) -> str:
-        """Return an HTTP MPEG-TS URL for `serial`, starting its proxy if needed."""
-        async with self._lock:
-            await self._async_ensure_logged_in()
-            port = await self._async_ensure_proxy_running(serial)
-        return f"http://{PROXY_LISTEN_HOST}:{port}/{serial}.ts"
+    async def async_get_stream_url(self, entry_id: str, serial: str) -> str:
+        """Return a signed URL for this HA instance's own stream view.
+
+        The view itself (`EzvizStreamView`) is what actually opens the
+        EZVIZ cloud connection, and only does so once a client GETs this
+        URL - so nothing happens here beyond ensuring we're logged in.
+        """
+        await self._async_ensure_logged_in()
+        path = EzvizStreamView.url_template(entry_id, serial)
+        signed_path = async_sign_path(self._hass, path, _SIGNED_URL_EXPIRATION)
+        port = self._hass.http.server_port
+        return f"http://127.0.0.1:{port}{signed_path}"
 
     async def async_close(self) -> None:
-        """Stop any running proxy subprocesses. Called on config entry unload."""
-        async with self._lock:
-            for serial, process in self._proxy_processes.items():
-                if process.returncode is None:
-                    _LOGGER.debug("Stopping EZVIZ stream proxy for %s", serial)
-                    process.terminate()
-            self._proxy_processes.clear()
-            self._proxy_ports.clear()
+        """Nothing to tear down - kept for symmetry with async_setup_entry."""
+
+    async def async_ensure_logged_in(self) -> Any:
+        """Ensure we're logged in and return the underlying vendored client.
+
+        Used by `EzvizStreamView` right before it opens the actual EZVIZ
+        cloud connection.
+        """
+        await self._async_ensure_logged_in()
+        assert self._client is not None
+        return self._client
 
     async def _async_ensure_logged_in(self) -> None:
-        """Log in (or refresh the existing session) via pyezvizapi.
+        """Log in (or refresh the existing session) via the vendored client.
 
-        Reuses a cached session token from disk when available so a restart
-        doesn't require a fresh password login. Safe to call repeatedly -
-        pyezvizapi's own `login()` only talks to the network when the
-        cached session is missing or expired.
+        Reuses a cached session token from disk when available so a
+        restart doesn't require a fresh password login. Safe to call
+        repeatedly - the vendored client's own `login()` only talks to the
+        network when the cached session is missing or expired.
         """
-        from pyezvizapi.client import EzvizClient as PyEzvizClient
-        from pyezvizapi.exceptions import PyEzvizError
+        from .vendor.pyezvizapi.client import EzvizClient as PyEzvizClient
+        from .vendor.pyezvizapi.exceptions import PyEzvizError
 
-        if self._client is None:
-            token = await self._hass.async_add_executor_job(self._load_token)
-            self._client = PyEzvizClient(
-                account=self._account, password=self._password, token=token
-            )
+        async with self._login_lock:
+            if self._client is None:
+                token = await self._hass.async_add_executor_job(self._load_token)
+                self._client = PyEzvizClient(
+                    account=self._account, password=self._password, token=token
+                )
 
-        try:
-            await self._hass.async_add_executor_job(self._client.login)
-        except PyEzvizError as err:
-            raise EzvizAuthError(f"EZVIZ login failed: {err}") from err
+            try:
+                await self._hass.async_add_executor_job(self._client.login)
+            except PyEzvizError as err:
+                raise EzvizAuthError(f"EZVIZ login failed: {err}") from err
 
-        await self._hass.async_add_executor_job(self._save_token)
-
-    async def _async_ensure_proxy_running(self, serial: str) -> int:
-        """Start the `pyezvizapi stream proxy` subprocess for `serial` if needed."""
-        process = self._proxy_processes.get(serial)
-        if process is not None and process.returncode is None:
-            return self._proxy_ports[serial]
-
-        port = _port_for_serial(serial)
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "pyezvizapi",
-            "--token-file",
-            str(self._token_path),
-            "stream",
-            "proxy",
-            "--serial",
-            serial,
-            "--listen-host",
-            PROXY_LISTEN_HOST,
-            "--listen-port",
-            str(port),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        self._proxy_processes[serial] = process
-        self._proxy_ports[serial] = port
-
-        await _async_wait_for_port(PROXY_LISTEN_HOST, port, _PROXY_READY_TIMEOUT)
-        return port
+            await self._hass.async_add_executor_job(self._save_token)
 
     def _load_token(self) -> dict[str, Any] | None:
         """Load a cached pyezvizapi session token from disk, if any."""
@@ -147,12 +126,7 @@ class EzvizClient:
             return None
 
     def _save_token(self) -> None:
-        """Persist the current pyezvizapi session token to disk.
-
-        This is the hand-off mechanism to the separate `stream proxy`
-        subprocess, which authenticates via `--token-file` instead of
-        being passed the account password on its command line.
-        """
+        """Persist the current pyezvizapi session token to disk."""
         assert self._client is not None
         self._token_path.parent.mkdir(parents=True, exist_ok=True)
         self._token_path.write_text(
@@ -160,31 +134,91 @@ class EzvizClient:
         )
 
 
-def _port_for_serial(serial: str) -> int:
-    """Deterministically map a device serial to a loopback port.
-
-    Keeps multiple cameras from colliding on the same port without needing
-    extra user-facing configuration.
+class _QueueOutput:
+    """File-like bridge from the sync `copy_cloud_stream_to_mpegts` call
+    (running in an executor thread) to the async HTTP response writing the
+    bytes out to whoever asked for the stream.
     """
-    digest = int(hashlib.sha1(serial.encode()).hexdigest(), 16)
-    return _PROXY_PORT_BASE + (digest % _PROXY_PORT_RANGE)
+
+    def __init__(self, hass: HomeAssistant, queue: asyncio.Queue[bytes | None]) -> None:
+        self._loop = hass.loop
+        self._queue = queue
+        self._closed = threading.Event()
+
+    def write(self, data: bytes) -> int:
+        """Called from the executor thread with each remuxed chunk."""
+        if self._closed.is_set():
+            raise BrokenPipeError("EZVIZ stream view: HTTP client disconnected")
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, data)
+        return len(data)
+
+    def close(self) -> None:
+        """Signal the executor thread's next write() to stop cleanly."""
+        self._closed.set()
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
 
 
-async def _async_wait_for_port(host: str, port: int, timeout: float) -> None:
-    """Wait until `host:port` accepts TCP connections, or give up silently.
+class EzvizStreamView(HomeAssistantView):
+    """Serves the EZVIZ cloud VTM stream as HTTP MPEG-TS.
 
-    Best-effort only: if the proxy is slow to bind we still return the URL
-    and let the stream client's own retry/backoff handle it.
+    Registered once for the whole integration (not per config entry); the
+    entry/serial are part of the URL and looked up at request time. Access
+    is via a short-lived signed URL (see `EzvizClient.async_get_stream_url`)
+    rather than a normal bearer token, since the stream is opened by HA's
+    own ffmpeg subprocess, which can't supply one.
     """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
+
+    url = "/api/ezviz_stream/{entry_id}/{serial}.ts"
+    name = "api:ezviz_stream"
+
+    @staticmethod
+    def url_template(entry_id: str, serial: str) -> str:
+        """Build the concrete path for one entry/serial pair."""
+        return f"/api/ezviz_stream/{entry_id}/{serial}.ts"
+
+    async def get(self, request: web.Request, entry_id: str, serial: str) -> web.StreamResponse:
+        """Handle a GET: log in if needed, then stream MPEG-TS until the client leaves."""
+        hass: HomeAssistant = request.app["hass"]
+        client: EzvizClient | None = hass.data.get(DOMAIN, {}).get(entry_id)
+        if client is None:
+            return web.Response(status=404, text="Unknown EZVIZ Stream config entry")
+
+        from .vendor.pyezvizapi.cloud_stream import copy_cloud_stream_to_mpegts
+        from .vendor.pyezvizapi.exceptions import PyEzvizError
+
         try:
-            _, writer = await asyncio.open_connection(host, port)
-        except OSError:
-            await asyncio.sleep(0.2)
-            continue
-        writer.close()
-        await writer.wait_closed()
-        return
-    _LOGGER.debug("EZVIZ stream proxy on port %s not ready after %.1fs", port, timeout)
+            pyez_client = await client.async_ensure_logged_in()
+        except EzvizAuthError as err:
+            return web.Response(status=502, text=str(err))
+
+        response = web.StreamResponse(
+            status=200, headers={"Content-Type": "video/mp2t"}
+        )
+        await response.prepare(request)
+
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
+        output = _QueueOutput(hass, queue)
+
+        def _copy() -> None:
+            try:
+                copy_cloud_stream_to_mpegts(pyez_client, serial, output)
+            except (PyEzvizError, OSError):
+                _LOGGER.exception("EZVIZ stream copy failed for %s", serial)
+            finally:
+                output.close()
+
+        copy_job = hass.async_add_executor_job(_copy)
+
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                await response.write(chunk)
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            output.close()
+            await copy_job
+
+        return response

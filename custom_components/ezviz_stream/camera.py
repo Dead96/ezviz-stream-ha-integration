@@ -100,4 +100,4 @@ class EzvizStreamCamera(Camera):
         performs network I/O toward the device/cloud, and it's only ever
         called from `stream_source()`, so it stays fully on-demand.
         """
-        return await self._client.async_get_stream_url(self._serial)
+        return await self._client.async_get_stream_url(self._entry.entry_id, self._serial)

@@ -19,13 +19,14 @@ Streaming only happens through EZVIZ's proprietary cloud VTM relay
 
 ```
 custom_components/ezviz_stream/
-├── __init__.py        # sets up the entry, creates the EZVIZ client, forwards to the camera platform
+├── __init__.py        # sets up the entry, registers the stream view, forwards to the camera platform
 ├── camera.py           # camera entity: the "on-demand" logic lives here
-├── ezviz_client.py      # login + stream proxy lifecycle, via pyezvizapi
+├── ezviz_client.py      # login + the HTTP view that streams MPEG-TS on demand
 ├── config_flow.py       # UI configuration form (Settings > Devices & services)
 ├── const.py
 ├── manifest.json
 ├── strings.json
+├── vendor/pyezvizapi/    # vendored login/cloud-stream helpers (see THIRD_PARTY_LICENSES.md)
 └── translations/
     ├── en.json
     └── it.json
@@ -45,61 +46,68 @@ In [`camera.py`](custom_components/ezviz_stream/camera.py):
   `camera.record`, etc.). It delegates to
   [`EzvizClient.async_get_stream_url()`](custom_components/ezviz_stream/ezviz_client.py).
 
-## How the streaming works (`ezviz_client.py`)
+## How the streaming works
 
-We don't reimplement EZVIZ's proprietary cloud protocol ourselves: we rely
-on [`pyezvizapi`](https://pypi.org/project/pyezvizapi/) (the same library
-the official Home Assistant EZVIZ integration uses for login/device
-management), which also ships an experimental `stream proxy` command that
-speaks the VTM protocol, remuxes it with `ffmpeg`, and re-serves it as
-plain HTTP MPEG-TS — something Home Assistant's `stream` component can
-open directly.
+We don't reimplement EZVIZ's proprietary cloud protocol ourselves: we
+depend on login/cloud-stream helpers from
+[RenierM26/pyEzvizApi](https://github.com/RenierM26/pyEzvizApi) (the same
+project the official Home Assistant EZVIZ integration uses), which can
+speak the VTM protocol and remux it with `ffmpeg` into plain MPEG-TS.
 
-**Verified manually end-to-end** against this device: login (v5 API,
-MD5-hashed password) followed by pulling the cloud VTM stream through the
-proxy returned real MPEG-TS video bytes (`Content-Type: video/MP2T`).
+This code is **vendored** into
+[`vendor/pyezvizapi/`](custom_components/ezviz_stream/vendor/pyezvizapi/)
+rather than declared as a normal `pyezvizapi` pip dependency: the
+`login`/`export_token`/`cloud_stream` helpers this integration relies on
+live on that project's `main` branch but aren't part of the version
+currently published on PyPI. See
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for the Apache-2.0
+attribution.
 
-On the first call to `async_get_stream_url(serial)`:
+**Verified manually end-to-end** against this device: login (MD5-hashed
+password) followed by pulling the cloud VTM stream returned real MPEG-TS
+video bytes.
 
-1. Login (or session refresh) via `pyezvizapi`, run in an executor since
-   the library is synchronous (`requests`-based). The session token is
-   cached to disk (`.storage/ezviz_stream_<entry_id>.json`).
-2. If not already running, a subprocess is started:
-   `python -m pyezvizapi --token-file ... stream proxy --serial ... --listen-port ...`,
-   bound only to `127.0.0.1` on a port deterministically derived from the
-   serial (range 8558-8657). The subprocess stays listening but **never
-   talks to EZVIZ until a client actually connects** to the HTTP URL.
-3. `http://127.0.0.1:<port>/<serial>.ts` is returned, which HA hands to its
-   own stream/ffmpeg pipeline for playback.
+Rather than spawning a separate subprocess/port, the stream is served
+through an HTTP view registered directly on Home Assistant's own web
+server ([`EzvizStreamView`](custom_components/ezviz_stream/ezviz_client.py)):
 
-The subprocess is terminated in `async_unload_entry` when the integration
-is removed/reloaded.
+1. `stream_source()` calls `EzvizClient.async_get_stream_url()`, which
+   ensures we're logged in (cached session token at
+   `.storage/ezviz_stream_<entry_id>.json`, so restarts don't need a fresh
+   password login) and returns a short-lived **signed URL**
+   (`/api/ezviz_stream/<entry_id>/<serial>.ts`) — the same
+   `async_sign_path` mechanism Home Assistant's own camera component uses
+   for URLs that ffmpeg opens directly, since ffmpeg can't supply a bearer
+   token.
+2. Home Assistant's stream pipeline opens that URL. Only *then* does
+   `EzvizStreamView.get()` open the actual EZVIZ cloud VTM connection,
+   spawn `ffmpeg` to remux it, and stream the MPEG-TS bytes back — nothing
+   talks to EZVIZ before a client actually connects.
+3. When the HTTP client disconnects, the `ffmpeg`/VTM copy loop is torn
+   down.
 
 ### External dependencies
 
-- `pyezvizapi` (declared in `manifest.json`, installed automatically by
-  Home Assistant).
+- `pycryptodome`, `requests`, `paho-mqtt`, `xmltodict` (declared in
+  `manifest.json`, installed automatically by Home Assistant) — required
+  by the vendored `pyezvizapi` code.
 - **`ffmpeg`** must be available on the Home Assistant host's `PATH`
   (already present on Home Assistant OS/Supervised; needs checking on Core
   installs).
 
 ### Known limitations / TODO
 
-- **Startup latency**: in manual testing, it took about 10 seconds from
-  the first HTTP request to the first byte of video (spawning the
-  `ffmpeg` subprocess + initial buffering). This is inherent to the
-  proxy's remuxing approach, not something our integration adds on top —
-  worth keeping in mind if a dashboard card's own stream timeout is short.
-- No retry/backoff if the login or the proxy startup fails on the first
-  attempt — a second stream open request from HA just redoes everything
-  from scratch.
+- No retry/backoff if login fails on the first attempt — a second stream
+  open request from HA just redoes everything from scratch.
 - The device isn't currently encrypted (`isEncrypt: 0`): if encryption
-  gets enabled later, the proxy would need `--decrypt-video` plus the
+  gets enabled later, this would need `client.get_cam_key()` plus the
   verification code (already collected in the config flow as
   `verification_code`, not used yet).
 - The local proprietary CPD7 protocol (ports 9010/9020, used by other
   EZVIZ models like HP7/CP7) was not attempted: the cloud VTM path turned
   out to be sufficient and simpler.
+- Each viewer opens its own independent upstream EZVIZ connection (no
+  multiplexing) — fine for the expected single-viewer peephole use case.
 
 ## Installation
 

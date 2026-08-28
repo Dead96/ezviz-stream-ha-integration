@@ -15,7 +15,9 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, PLATFORMS
-from .ezviz_client import EzvizClient
+from .ezviz_client import EzvizClient, EzvizStreamView
+
+_VIEW_REGISTERED = "_view_registered"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -24,6 +26,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     Building the client here does not perform any network I/O - it only
     logs in lazily, the first time a camera actually needs a stream.
     """
+    domain_data = hass.data.setdefault(DOMAIN, {})
+
+    if not domain_data.get(_VIEW_REGISTERED):
+        hass.http.register_view(EzvizStreamView())
+        domain_data[_VIEW_REGISTERED] = True
+
     token_path = Path(hass.config.path(".storage", f"ezviz_stream_{entry.entry_id}.json"))
     client = EzvizClient(
         hass=hass,
@@ -31,7 +39,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         password=entry.data[CONF_PASSWORD],
         token_path=token_path,
     )
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = client
+    domain_data[entry.entry_id] = client
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
