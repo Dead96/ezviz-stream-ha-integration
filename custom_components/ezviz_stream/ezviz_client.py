@@ -152,6 +152,9 @@ class _QueueOutput:
         self._loop.call_soon_threadsafe(self._queue.put_nowait, data)
         return len(data)
 
+    def flush(self) -> None:
+        """No-op: each write() is already handed off immediately."""
+
     def close(self) -> None:
         """Signal the executor thread's next write() to stop cleanly."""
         self._closed.set()
