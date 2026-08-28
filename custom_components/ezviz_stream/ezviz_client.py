@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -181,6 +182,7 @@ class EzvizStreamView(HomeAssistantView):
 
     async def get(self, request: web.Request, entry_id: str, serial: str) -> web.StreamResponse:
         """Handle a GET: log in if needed, then stream MPEG-TS until the client leaves."""
+        t0 = time.monotonic()
         hass: HomeAssistant = request.app["hass"]
         client: EzvizClient | None = hass.data.get(DOMAIN, {}).get(entry_id)
         if client is None:
@@ -193,11 +195,13 @@ class EzvizStreamView(HomeAssistantView):
             pyez_client = await client.async_ensure_logged_in()
         except EzvizAuthError as err:
             return web.Response(status=502, text=str(err))
+        _LOGGER.debug("EZVIZ stream %s: logged in at +%.2fs", serial, time.monotonic() - t0)
 
         response = web.StreamResponse(
             status=200, headers={"Content-Type": "video/mp2t"}
         )
         await response.prepare(request)
+        _LOGGER.debug("EZVIZ stream %s: response prepared at +%.2fs", serial, time.monotonic() - t0)
 
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
         output = _QueueOutput(hass, queue)
@@ -212,16 +216,26 @@ class EzvizStreamView(HomeAssistantView):
 
         copy_job = hass.async_add_executor_job(_copy)
 
+        first_chunk = True
         try:
             while True:
                 chunk = await queue.get()
                 if chunk is None:
                     break
+                if first_chunk:
+                    _LOGGER.debug(
+                        "EZVIZ stream %s: first chunk (%d bytes) at +%.2fs",
+                        serial,
+                        len(chunk),
+                        time.monotonic() - t0,
+                    )
+                    first_chunk = False
                 await response.write(chunk)
         except (ConnectionResetError, asyncio.CancelledError):
-            pass
+            _LOGGER.debug("EZVIZ stream %s: client disconnected at +%.2fs", serial, time.monotonic() - t0)
         finally:
             output.close()
             await copy_job
+            _LOGGER.debug("EZVIZ stream %s: copy job finished at +%.2fs", serial, time.monotonic() - t0)
 
         return response

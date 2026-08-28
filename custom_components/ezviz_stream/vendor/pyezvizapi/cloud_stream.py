@@ -518,7 +518,15 @@ def _remux_cloud_mpegps_bytes_to_mpegts(
 
 
 def _open_cloud_mpegts_remux_process(ffmpeg_path: str) -> subprocess.Popen[bytes]:
-    """Open an FFmpeg process ready to remux MPEG-PS stdin to MPEG-TS."""
+    """Open an FFmpeg process ready to remux MPEG-PS stdin to MPEG-TS.
+
+    Low-latency flags (HA fork addition): ffmpeg's default probing
+    (~5s analyzeduration/probesize) pushed time-to-first-byte past what
+    Home Assistant's stream component waits for before giving up
+    ("Immediate exit requested"). The EZVIZ VTM payload is a known-shape
+    MPEG-PS (H.264/HEVC + optional G.711 audio), so it doesn't need
+    ffmpeg's default multi-second analysis window.
+    """
 
     try:
         return subprocess.Popen(
@@ -527,6 +535,14 @@ def _open_cloud_mpegts_remux_process(ffmpeg_path: str) -> subprocess.Popen[bytes
                 "-hide_banner",
                 "-loglevel",
                 "error",
+                "-fflags",
+                "nobuffer",
+                "-flags",
+                "low_delay",
+                "-probesize",
+                "32k",
+                "-analyzeduration",
+                "0",
                 "-f",
                 "mpeg",
                 "-i",
@@ -535,6 +551,8 @@ def _open_cloud_mpegts_remux_process(ffmpeg_path: str) -> subprocess.Popen[bytes
                 "copy",
                 "-f",
                 "mpegts",
+                "-muxdelay",
+                "0",
                 "pipe:1",
             ],
             stdin=subprocess.PIPE,

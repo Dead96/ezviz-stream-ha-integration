@@ -3,10 +3,11 @@
   "name": "EZVIZ Stream (On-Demand)",
   "codeowners": ["@Dead96"],
   "config_flow": true,
+  "dependencies": ["http"],
   "documentation": "https://github.com/Dead96/ezviz-stream-ha-integration",
   "integration_type": "hub",
   "iot_class": "calculated",
   "issue_tracker": "https://github.com/Dead96/ezviz-stream-ha-integration/issues",
   "requirements": ["pycryptodome>=3.19.0", "requests>=2.31.0", "paho-mqtt>=1.6.0", "xmltodict>=0.13.0"],
-  "version": "0.2.1"
+  "version": "0.2.2"
 }

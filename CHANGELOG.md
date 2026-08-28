@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.2] - 2026-08-28
+
+### Fixed
+
+- Added `http` to `manifest.json`'s `dependencies`: we use
+  `homeassistant.components.http` (for the stream view) without
+  declaring it, which hassfest correctly flagged.
+
+### Changed
+
+- The vendored ffmpeg remux process (`cloud_stream.py`) now uses
+  low-latency flags (`-fflags nobuffer -flags low_delay -probesize 32k
+  -analyzeduration 0 -muxdelay 0`) to cut down time-to-first-byte, after
+  real-world testing showed Home Assistant's stream pipeline giving up
+  ("Immediate exit requested") before the default ffmpeg probing settings
+  produced any output.
+- Added debug-level timing logs around login, response setup, and first
+  chunk received, to help diagnose remaining startup-latency issues.
+  Enable with:
+  ```yaml
+  logger:
+    logs:
+      custom_components.ezviz_stream: debug
+  ```
+
 ## [0.2.1] - 2026-08-28
 
 ### Fixed
