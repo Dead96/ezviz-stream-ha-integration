@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.3] - 2026-08-28
+
+### Fixed
+
+- Real-world testing (with Home Assistant's `go2rtc` streaming backend)
+  showed several near-simultaneous connections opened to the same
+  camera's stream view while go2rtc probes/retries a new source. Each one
+  independently tried to open its own EZVIZ VTM/P2P session, and the
+  device only supports one at a time, so most of them failed with
+  `DeviceException: Device offline or unreachable: timed out waiting for
+  VTM stream data` even though the device was fine.
+- Added a per-serial lock (`EzvizClient.stream_lock_for`) so concurrent
+  stream attempts for the same camera are serialized instead of
+  contending for the device's single session slot. Confirmed working:
+  the stream was visibly playable end-to-end once this contention was
+  the only remaining issue.
+
 ## [0.2.2] - 2026-08-28
 
 ### Fixed

@@ -64,6 +64,19 @@ class EzvizClient:
 
         self._client: Any | None = None  # vendored pyezvizapi.client.EzvizClient
         self._login_lock = asyncio.Lock()
+        self._stream_locks: dict[str, asyncio.Lock] = {}
+
+    def stream_lock_for(self, serial: str) -> asyncio.Lock:
+        """Return the lock serializing stream attempts for one serial.
+
+        The device only supports one active VTM/P2P session at a time, but
+        HA's go2rtc layer can open several near-simultaneous connections to
+        our stream view while probing/retrying a new source. Without this,
+        those attempts fight over the device's single session slot and
+        several time out with "Device offline or unreachable" even though
+        the device is fine - they just needed to go one at a time.
+        """
+        return self._stream_locks.setdefault(serial, asyncio.Lock())
 
     async def async_get_stream_url(self, entry_id: str, serial: str) -> str:
         """Return a signed URL for this HA instance's own stream view.
@@ -191,51 +204,62 @@ class EzvizStreamView(HomeAssistantView):
         from .vendor.pyezvizapi.cloud_stream import copy_cloud_stream_to_mpegts
         from .vendor.pyezvizapi.exceptions import PyEzvizError
 
-        try:
-            pyez_client = await client.async_ensure_logged_in()
-        except EzvizAuthError as err:
-            return web.Response(status=502, text=str(err))
-        _LOGGER.debug("EZVIZ stream %s: logged in at +%.2fs", serial, time.monotonic() - t0)
-
         response = web.StreamResponse(
             status=200, headers={"Content-Type": "video/mp2t"}
         )
         await response.prepare(request)
         _LOGGER.debug("EZVIZ stream %s: response prepared at +%.2fs", serial, time.monotonic() - t0)
 
-        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
-        output = _QueueOutput(hass, queue)
-
-        def _copy() -> None:
+        # The device only accepts one active VTM/P2P session at a time; go2rtc
+        # can open several near-simultaneous connections to this view while
+        # probing a new source, so serialize actual attempts per serial
+        # instead of letting them fight over the device's one session slot.
+        lock = client.stream_lock_for(serial)
+        async with lock:
+            _LOGGER.debug(
+                "EZVIZ stream %s: acquired stream lock at +%.2fs", serial, time.monotonic() - t0
+            )
             try:
-                copy_cloud_stream_to_mpegts(pyez_client, serial, output)
-            except (PyEzvizError, OSError):
-                _LOGGER.exception("EZVIZ stream copy failed for %s", serial)
+                pyez_client = await client.async_ensure_logged_in()
+            except EzvizAuthError as err:
+                return web.Response(status=502, text=str(err))
+            _LOGGER.debug("EZVIZ stream %s: logged in at +%.2fs", serial, time.monotonic() - t0)
+
+            queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
+            output = _QueueOutput(hass, queue)
+
+            def _copy() -> None:
+                try:
+                    copy_cloud_stream_to_mpegts(pyez_client, serial, output)
+                except (PyEzvizError, OSError):
+                    _LOGGER.exception("EZVIZ stream copy failed for %s", serial)
+                finally:
+                    output.close()
+
+            copy_job = hass.async_add_executor_job(_copy)
+
+            first_chunk = True
+            try:
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:
+                        break
+                    if first_chunk:
+                        _LOGGER.debug(
+                            "EZVIZ stream %s: first chunk (%d bytes) at +%.2fs",
+                            serial,
+                            len(chunk),
+                            time.monotonic() - t0,
+                        )
+                        first_chunk = False
+                    await response.write(chunk)
+            except (ConnectionResetError, asyncio.CancelledError):
+                _LOGGER.debug(
+                    "EZVIZ stream %s: client disconnected at +%.2fs", serial, time.monotonic() - t0
+                )
             finally:
                 output.close()
-
-        copy_job = hass.async_add_executor_job(_copy)
-
-        first_chunk = True
-        try:
-            while True:
-                chunk = await queue.get()
-                if chunk is None:
-                    break
-                if first_chunk:
-                    _LOGGER.debug(
-                        "EZVIZ stream %s: first chunk (%d bytes) at +%.2fs",
-                        serial,
-                        len(chunk),
-                        time.monotonic() - t0,
-                    )
-                    first_chunk = False
-                await response.write(chunk)
-        except (ConnectionResetError, asyncio.CancelledError):
-            _LOGGER.debug("EZVIZ stream %s: client disconnected at +%.2fs", serial, time.monotonic() - t0)
-        finally:
-            output.close()
-            await copy_job
+                await copy_job
             _LOGGER.debug("EZVIZ stream %s: copy job finished at +%.2fs", serial, time.monotonic() - t0)
 
         return response
