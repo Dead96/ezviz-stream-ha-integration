@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add EZVIZ peephole camera",
+        "data": {
+          "name": "Name",
+          "serial": "Device serial number",
+          "username": "EZVIZ username (optional, needed for cloud API)",
+          "password": "EZVIZ password (optional, needed for cloud API)",
+          "verification_code": "Verification code (optional, printed on the device)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This device is already configured."
+    }
+  }
+}

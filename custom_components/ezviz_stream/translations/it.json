@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Aggiungi videocamera spioncino EZVIZ",
+        "data": {
+          "name": "Nome",
+          "serial": "Numero seriale del dispositivo",
+          "username": "Username EZVIZ (opzionale, per API cloud)",
+          "password": "Password EZVIZ (opzionale, per API cloud)",
+          "verification_code": "Codice di verifica (opzionale, stampato sul dispositivo)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Questo dispositivo è già configurato."
+    }
+  }
+}
