@@ -210,11 +210,24 @@ class EzvizStreamView(HomeAssistantView):
         await response.prepare(request)
         _LOGGER.debug("EZVIZ stream %s: response prepared at +%.2fs", serial, time.monotonic() - t0)
 
-        # The device only accepts one active VTM/P2P session at a time; go2rtc
-        # can open several near-simultaneous connections to this view while
-        # probing a new source, so serialize actual attempts per serial
-        # instead of letting them fight over the device's one session slot.
+        # The device only accepts one active VTM/P2P session at a time, and
+        # go2rtc can open several near-simultaneous connections to this view
+        # while probing/retrying a new source. Waiting for a busy slot (a
+        # plain lock) made things worse in testing: go2rtc's own patience
+        # per attempt is only a few seconds, so a request queued behind
+        # someone else's slow/hung attempt never gets a fair shot before
+        # go2rtc gives up and retries anyway - and the next one queues too.
+        # Failing fast instead lets go2rtc's own retries each get an
+        # unblocked attempt.
         lock = client.stream_lock_for(serial)
+        if lock.locked():
+            _LOGGER.debug(
+                "EZVIZ stream %s: another attempt already in flight, failing fast at +%.2fs",
+                serial,
+                time.monotonic() - t0,
+            )
+            return response
+
         async with lock:
             _LOGGER.debug(
                 "EZVIZ stream %s: acquired stream lock at +%.2fs", serial, time.monotonic() - t0

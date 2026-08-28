@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.4] - 2026-08-28
+
+### Fixed
+
+- The 0.2.3 lock made things worse, not better: real-world logs showed
+  attempts queuing behind each other for over two minutes, because
+  individual VTM connection attempts can themselves take anywhere from
+  ~8s to 70+s (this looks like inherent battery-camera wake-up latency,
+  not something in our control), and go2rtc only waits a few seconds per
+  attempt before giving up and retrying on its own. Waiting in line
+  behind a slow attempt meant every queued request was already doomed by
+  the time its turn came.
+- Changed to a "fail fast if busy" check instead of waiting for the
+  lock: a new request only proceeds if no other attempt for that serial
+  is currently in flight, otherwise it returns immediately (empty
+  response) so go2rtc's own retry loop gets an unblocked shot next time,
+  instead of joining a growing queue.
+
 ## [0.2.3] - 2026-08-28
 
 ### Fixed
