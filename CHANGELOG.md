@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.0] - 2026-08-28
+
+### Added
+
+- A placeholder video (solid color, generated on the fly with `ffmpeg`'s
+  `lavfi` source - no extra image/font assets needed) is now streamed
+  immediately when the stream view is opened, before the real EZVIZ VTM
+  connection has produced any data. This addresses two problems at once:
+  - go2rtc gave up almost immediately ("Immediate exit requested") when
+    the connection produced no bytes for the first several seconds -
+    real testing showed VTM connect times ranging from ~8s to well over
+    a minute (looks like inherent battery-camera wake-up latency).
+  - The "fail fast if busy" behavior from 0.2.4 returned a truly empty
+    response for the losing concurrent attempts, which appears to have
+    made go2rtc treat that source as broken (its internal RTSP restream
+    later 404'd on it) rather than just retry.
+- The connection that wins the per-serial attempt ("owner") switches
+  seamlessly from placeholder to the real feed the moment real data
+  arrives. Connections that lose ("followers", since the device only
+  supports one VTM/P2P session at a time) show the placeholder for up to
+  15 seconds and then close, instead of contending with the owner or
+  queuing behind it.
+
 ## [0.2.4] - 2026-08-28
 
 ### Fixed

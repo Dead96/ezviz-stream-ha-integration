@@ -22,6 +22,7 @@ below - never on a timer, never in the background.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import threading
@@ -40,6 +41,16 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 _SIGNED_URL_EXPIRATION = timedelta(minutes=5)
+
+# Placeholder video shown while the real EZVIZ VTM connection (which can
+# take anywhere from a few seconds to over a minute - this looks like
+# inherent battery-camera wake-up latency) is still being established.
+# Plain solid color, no drawtext: avoids depending on a font being present
+# in whatever ffmpeg build the Home Assistant host happens to have.
+_PLACEHOLDER_COLOR = "0x1c1c1e"
+_PLACEHOLDER_SIZE = "640x360"
+_PLACEHOLDER_FPS = "2"
+_FOLLOWER_PLACEHOLDER_MAX_SECONDS = 15.0
 
 
 class EzvizAuthError(Exception):
@@ -175,6 +186,69 @@ class _QueueOutput:
         self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
 
 
+async def _stream_placeholder(
+    response: web.StreamResponse,
+    stop_event: asyncio.Event,
+    max_duration: float | None = None,
+) -> None:
+    """Write a looping placeholder video to `response` until `stop_event` fires.
+
+    Best-effort: if ffmpeg can't be started, just returns immediately and
+    the caller proceeds without a placeholder.
+    """
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={_PLACEHOLDER_COLOR}:s={_PLACEHOLDER_SIZE}:r={_PLACEHOLDER_FPS}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "mpegts",
+            "-muxdelay",
+            "0",
+            "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        _LOGGER.debug("EZVIZ stream placeholder: could not start ffmpeg")
+        return
+
+    deadline = time.monotonic() + max_duration if max_duration is not None else None
+    try:
+        assert process.stdout is not None
+        while not stop_event.is_set():
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            try:
+                chunk = await asyncio.wait_for(process.stdout.read(32768), timeout=0.5)
+            except TimeoutError:
+                continue
+            if not chunk:
+                break
+            await response.write(chunk)
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        if process.returncode is None:
+            process.kill()
+        with contextlib.suppress(ProcessLookupError):
+            await process.wait()
+
+
 class EzvizStreamView(HomeAssistantView):
     """Serves the EZVIZ cloud VTM stream as HTTP MPEG-TS.
 
@@ -212,30 +286,42 @@ class EzvizStreamView(HomeAssistantView):
 
         # The device only accepts one active VTM/P2P session at a time, and
         # go2rtc can open several near-simultaneous connections to this view
-        # while probing/retrying a new source. Waiting for a busy slot (a
-        # plain lock) made things worse in testing: go2rtc's own patience
-        # per attempt is only a few seconds, so a request queued behind
-        # someone else's slow/hung attempt never gets a fair shot before
-        # go2rtc gives up and retries anyway - and the next one queues too.
-        # Failing fast instead lets go2rtc's own retries each get an
-        # unblocked attempt.
+        # while probing/retrying a new source. Only one of them ("owner")
+        # actually attempts the EZVIZ connection; the rest ("followers") just
+        # get the placeholder for a bit and then close, instead of either
+        # fighting the owner for the device's one session slot or queuing
+        # behind it (queuing made things worse: go2rtc's patience per
+        # attempt is only a few seconds, far less than a slow/hung attempt
+        # can take, so everything downstream of a queue timed out anyway).
         lock = client.stream_lock_for(serial)
-        if lock.locked():
+        is_owner = not lock.locked()
+        if is_owner:
+            await lock.acquire()
+
+        real_data_ready = asyncio.Event()
+        placeholder_task = hass.async_create_task(
+            _stream_placeholder(
+                response,
+                real_data_ready,
+                max_duration=None if is_owner else _FOLLOWER_PLACEHOLDER_MAX_SECONDS,
+            )
+        )
+
+        if not is_owner:
             _LOGGER.debug(
-                "EZVIZ stream %s: another attempt already in flight, failing fast at +%.2fs",
+                "EZVIZ stream %s: another attempt already in flight, placeholder-only at +%.2fs",
                 serial,
                 time.monotonic() - t0,
             )
+            await placeholder_task
             return response
 
-        async with lock:
-            _LOGGER.debug(
-                "EZVIZ stream %s: acquired stream lock at +%.2fs", serial, time.monotonic() - t0
-            )
+        try:
             try:
                 pyez_client = await client.async_ensure_logged_in()
-            except EzvizAuthError as err:
-                return web.Response(status=502, text=str(err))
+            except EzvizAuthError:
+                _LOGGER.exception("EZVIZ stream %s: login failed", serial)
+                return response
             _LOGGER.debug("EZVIZ stream %s: logged in at +%.2fs", serial, time.monotonic() - t0)
 
             queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
@@ -265,6 +351,11 @@ class EzvizStreamView(HomeAssistantView):
                             time.monotonic() - t0,
                         )
                         first_chunk = False
+                        # Real data is ready: let the placeholder finish its
+                        # current write and stop before we write anything
+                        # else, so the two never interleave on `response`.
+                        real_data_ready.set()
+                        await placeholder_task
                     await response.write(chunk)
             except (ConnectionResetError, asyncio.CancelledError):
                 _LOGGER.debug(
@@ -274,5 +365,10 @@ class EzvizStreamView(HomeAssistantView):
                 output.close()
                 await copy_job
             _LOGGER.debug("EZVIZ stream %s: copy job finished at +%.2fs", serial, time.monotonic() - t0)
+        finally:
+            real_data_ready.set()
+            if not placeholder_task.done():
+                await placeholder_task
+            lock.release()
 
         return response
