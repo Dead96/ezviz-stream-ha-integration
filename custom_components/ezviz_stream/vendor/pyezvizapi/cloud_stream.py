@@ -532,6 +532,7 @@ def _open_cloud_mpegts_remux_process(ffmpeg_path: str) -> subprocess.Popen[bytes
         return subprocess.Popen(
             [
                 ffmpeg_path,
+                "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",

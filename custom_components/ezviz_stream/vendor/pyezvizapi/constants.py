@@ -5,9 +5,19 @@ client, and a large collection of enums that map integers/strings from
 the Ezviz API to descriptive names.
 """
 
-from enum import Enum, StrEnum, unique
+from enum import Enum, unique
 from hashlib import md5
 import uuid
+
+try:
+    from enum import StrEnum  # Python 3.11+
+except ImportError:  # pragma: no cover - Python 3.10 fallback
+
+    class StrEnum(str, Enum):
+        """Minimal backport of Python 3.11's enum.StrEnum."""
+
+        def __str__(self) -> str:
+            return str(self.value)
 
 
 def _generate_unique_code() -> str:

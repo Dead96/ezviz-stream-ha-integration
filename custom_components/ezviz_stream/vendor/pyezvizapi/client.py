@@ -11,12 +11,27 @@ import logging
 import os
 from pathlib import Path
 import time
-from typing import Any, BinaryIO, ClassVar, Literal, NotRequired, TypedDict, cast
+from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, cast
 from urllib.parse import urlencode
 from uuid import uuid4
 import zlib
 
 import requests
+
+try:
+    from typing import NotRequired  # Python 3.11+
+except ImportError:
+    try:
+        from typing_extensions import NotRequired
+    except ImportError:
+        # `from __future__ import annotations` is active in this file, so
+        # TypedDict field annotations using NotRequired[...] are never
+        # evaluated at runtime - only the import needs to succeed. This
+        # sentinel supports subscripting (NotRequired[str]) but is never
+        # actually invoked.
+        class NotRequired:  # type: ignore[no-redef]
+            def __class_getitem__(cls, item: object) -> object:
+                return item
 
 from . import device_factory
 from .api_endpoints import (

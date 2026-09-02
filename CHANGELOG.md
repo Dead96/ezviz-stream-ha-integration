@@ -2,6 +2,48 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.2] - 2026-09-02
+
+### Added
+
+- A periodic keep-alive call (`delay_battery_device_sleep`, every 30s
+  while a client is actively watching) to counteract the device's default
+  ~60s auto-close on the live view. Best-effort only: failures are logged
+  and retried a few times but never interrupt the video stream. Testing
+  with `scripts/vtm_demo.py` (see 0.3.1) took playback from a hard ~58s
+  ceiling to 100-180s per session, though results were noisy across runs
+  and this isn't a guaranteed-indefinite fix - see the code comments in
+  `ezviz_client.py` next to `_KEEPALIVE_INTERVAL_SECONDS` for the tuning
+  history and reasoning.
+
+## [0.3.1] - 2026-09-02
+
+### Changed
+
+- The loading placeholder is now a pre-rendered static image
+  (`assets/placeholder.png` - a lens/spinner icon with "Connecting..." /
+  "Waking up the camera" text) looped with ffmpeg, instead of a plain solid
+  color. Still no `drawtext`/font dependency at runtime: the image is
+  rendered once at dev time and shipped as a plain asset, so nothing about
+  the Home Assistant host's ffmpeg build matters.
+- Verified with a new standalone test tool
+  (`scripts/vtm_demo.py`, mirroring `scripts/p2p_demo/demo.py`'s pattern):
+  serves the VTM stream with the same placeholder-then-switch-over logic as
+  the real integration, as local HTTP MPEG-TS for testing with curl/VLC
+  without touching Home Assistant. Confirmed the placeholder-to-real-stream
+  handoff is clean (no glitch/interleaving) end-to-end.
+
+### Known issue under investigation
+
+- Real-world testing showed the VTM stream itself dying after ~58s of
+  playback with "Device offline or unreachable: timed out waiting for VTM
+  stream data" - suspiciously close to a common ~60s battery-camera
+  auto-timeout window. Trying a periodic `delay_battery_device_sleep()`
+  call while streaming (the same endpoint investigated earlier, but as a
+  keep-alive during an active view rather than a pre-connect wake-up) to
+  see if it extends the session, mirroring what a "keep watching?" prompt
+  in the official app likely does.
+
 ## [0.3.0] - 2026-08-28
 
 ### Added

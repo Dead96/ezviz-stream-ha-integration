@@ -44,13 +44,30 @@ _SIGNED_URL_EXPIRATION = timedelta(minutes=5)
 
 # Placeholder video shown while the real EZVIZ VTM connection (which can
 # take anywhere from a few seconds to over a minute - this looks like
-# inherent battery-camera wake-up latency) is still being established.
-# Plain solid color, no drawtext: avoids depending on a font being present
-# in whatever ffmpeg build the Home Assistant host happens to have.
-_PLACEHOLDER_COLOR = "0x1c1c1e"
-_PLACEHOLDER_SIZE = "640x360"
+# inherent battery-camera wake-up latency) is still being established. A
+# pre-rendered static image looped with ffmpeg - no drawtext, so nothing
+# depends on a font being present in whatever ffmpeg build the Home
+# Assistant host happens to have.
+_PLACEHOLDER_IMAGE = Path(__file__).parent / "assets" / "placeholder.png"
 _PLACEHOLDER_FPS = "2"
 _FOLLOWER_PLACEHOLDER_MAX_SECONDS = 15.0
+
+# The device closes the VTM stream after a fixed watch duration (~60s
+# observed) unless renewed - a battery-saving measure the official app
+# presumably works around with a "keep watching?" prompt. `delay_battery_
+# device_sleep` (undocumented) is our best-effort stand-in: called
+# periodically while a client is actually watching. Testing showed calling
+# it too often gets rejected (looks like the server only accepts a renewal
+# close to the current grant's expiry, not earlier) - 30s was the best
+# result found by trial and error against a noisy, undocumented API, not a
+# value with a known-correct justification. A short retry covers isolated
+# failures without waiting a full extra interval. See "delay_battery_
+# device_sleep" call below and CHANGELOG for the testing history.
+_KEEPALIVE_INTERVAL_SECONDS = 30.0
+_KEEPALIVE_MAX_RETRIES = 3
+_KEEPALIVE_RETRY_DELAY_SECONDS = 5.0
+_KEEPALIVE_CHANNEL = 1
+_KEEPALIVE_SLEEP_TYPE = 1
 
 
 class EzvizAuthError(Exception):
@@ -199,14 +216,17 @@ async def _stream_placeholder(
     try:
         process = await asyncio.create_subprocess_exec(
             "ffmpeg",
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
             "-re",
-            "-f",
-            "lavfi",
+            "-loop",
+            "1",
             "-i",
-            f"color=c={_PLACEHOLDER_COLOR}:s={_PLACEHOLDER_SIZE}:r={_PLACEHOLDER_FPS}",
+            str(_PLACEHOLDER_IMAGE),
+            "-r",
+            _PLACEHOLDER_FPS,
             "-c:v",
             "libx264",
             "-preset",
@@ -220,6 +240,7 @@ async def _stream_placeholder(
             "-muxdelay",
             "0",
             "pipe:1",
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -247,6 +268,52 @@ async def _stream_placeholder(
             process.kill()
         with contextlib.suppress(ProcessLookupError):
             await process.wait()
+
+
+async def _keepalive_loop(
+    hass: HomeAssistant,
+    pyez_client: Any,
+    serial: str,
+    stop_event: asyncio.Event,
+) -> None:
+    """Periodically call `delay_battery_device_sleep` while a client is
+    watching, to stop the device closing the stream after its default
+    watch duration. Best-effort: failures are logged and retried a few
+    times, but never interrupt the actual video stream.
+    """
+    while True:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=_KEEPALIVE_INTERVAL_SECONDS)
+            return  # stop_event fired - client disconnected
+        except TimeoutError:
+            pass
+
+        for attempt in range(1, _KEEPALIVE_MAX_RETRIES + 1):
+            try:
+                result = await hass.async_add_executor_job(
+                    pyez_client.delay_battery_device_sleep,
+                    serial,
+                    _KEEPALIVE_CHANNEL,
+                    _KEEPALIVE_SLEEP_TYPE,
+                )
+                _LOGGER.debug("EZVIZ stream %s: keep-alive ok: %s", serial, result)
+                break
+            except Exception:  # noqa: BLE001 - best-effort, never fatal to the stream
+                _LOGGER.debug(
+                    "EZVIZ stream %s: keep-alive failed (attempt %d/%d)",
+                    serial,
+                    attempt,
+                    _KEEPALIVE_MAX_RETRIES,
+                    exc_info=True,
+                )
+                if attempt < _KEEPALIVE_MAX_RETRIES:
+                    try:
+                        await asyncio.wait_for(
+                            stop_event.wait(), timeout=_KEEPALIVE_RETRY_DELAY_SECONDS
+                        )
+                        return  # stop_event fired during the retry wait
+                    except TimeoutError:
+                        pass
 
 
 class EzvizStreamView(HomeAssistantView):
@@ -337,6 +404,11 @@ class EzvizStreamView(HomeAssistantView):
 
             copy_job = hass.async_add_executor_job(_copy)
 
+            keepalive_stop = asyncio.Event()
+            keepalive_task = hass.async_create_task(
+                _keepalive_loop(hass, pyez_client, serial, keepalive_stop)
+            )
+
             first_chunk = True
             try:
                 while True:
@@ -364,6 +436,8 @@ class EzvizStreamView(HomeAssistantView):
             finally:
                 output.close()
                 await copy_job
+                keepalive_stop.set()
+                await keepalive_task
             _LOGGER.debug("EZVIZ stream %s: copy job finished at +%.2fs", serial, time.monotonic() - t0)
         finally:
             real_data_ready.set()
