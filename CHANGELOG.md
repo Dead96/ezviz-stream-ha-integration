@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.0] - 2026-09-02
+
+### Changed
+
+- Replaced the "one owner gets the real feed, everyone else gets a
+  placeholder for 15s and gives up" design with real fan-out: all
+  concurrent viewers of one camera (e.g. two browser tabs, or go2rtc's own
+  extra probe connections) now share the single real EZVIZ VTM connection
+  and all receive the actual video, instead of only the first one to
+  connect. Found via real-world testing: opening the same camera in two
+  browser tabs left one showing live video and the other stuck on the
+  placeholder indefinitely.
+- The real EZVIZ connection (and its keep-alive loop) now starts when the
+  first viewer for a serial attaches and is torn down once the last one
+  disconnects, whoever they are - it's no longer tied to a single "owning"
+  request. This also keeps the device's one-session-at-a-time limit
+  architecturally impossible to violate, rather than relying on a lock to
+  avoid contention.
+- A viewer joining a stream that's already flowing will briefly see the
+  placeholder until the next real chunk reaches it (typically well under a
+  second), then switches over like any other viewer.
+
 ## [0.3.3] - 2026-09-02
 
 ### Fixed

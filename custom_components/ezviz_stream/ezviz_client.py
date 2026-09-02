@@ -56,7 +56,11 @@ _SIGNED_URL_EXPIRATION = timedelta(hours=1)
 # Assistant host happens to have.
 _PLACEHOLDER_IMAGE = Path(__file__).parent / "assets" / "placeholder.png"
 _PLACEHOLDER_FPS = "2"
-_FOLLOWER_PLACEHOLDER_MAX_SECONDS = 15.0
+
+# Cap on how many chunks a single subscriber can lag behind before we start
+# dropping frames for it. Keeps one slow viewer from ever blocking the
+# shared upstream or the other viewers.
+_SUBSCRIBER_QUEUE_SIZE = 64
 
 # The device closes the VTM stream after a fixed watch duration (~60s
 # observed) unless renewed - a battery-saving measure the official app
@@ -98,19 +102,53 @@ class EzvizClient:
 
         self._client: Any | None = None  # vendored pyezvizapi.client.EzvizClient
         self._login_lock = asyncio.Lock()
-        self._stream_locks: dict[str, asyncio.Lock] = {}
 
-    def stream_lock_for(self, serial: str) -> asyncio.Lock:
-        """Return the lock serializing stream attempts for one serial.
+        # The device only supports one active VTM/P2P session at a time, but
+        # several viewers may want to watch at once (two browser tabs, or
+        # go2rtc opening its own extra probe connections). Rather than
+        # fighting over the device's single session slot, all concurrent
+        # viewers of one serial share the same real EZVIZ connection -
+        # `_SharedStream` fans its bytes out to every subscriber.
+        self._shared_streams: dict[str, _SharedStream] = {}
+        self._shared_streams_lock = asyncio.Lock()
 
-        The device only supports one active VTM/P2P session at a time, but
-        HA's go2rtc layer can open several near-simultaneous connections to
-        our stream view while probing/retrying a new source. Without this,
-        those attempts fight over the device's single session slot and
-        several time out with "Device offline or unreachable" even though
-        the device is fine - they just needed to go one at a time.
+    async def async_attach_stream(
+        self, serial: str
+    ) -> tuple[_SharedStream, asyncio.Queue[bytes | None]]:
+        """Attach a new viewer to the shared stream for `serial`.
+
+        Starts the real EZVIZ connection if this is the first viewer for
+        that serial; otherwise reuses the one already running. Returns the
+        shared stream (needed later to detach) and a queue that will
+        receive that stream's MPEG-TS chunks (a `None` marks the end).
         """
-        return self._stream_locks.setdefault(serial, asyncio.Lock())
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_SIZE)
+        async with self._shared_streams_lock:
+            shared = self._shared_streams.get(serial)
+            if shared is None:
+                shared = _SharedStream(self._hass, serial)
+                self._shared_streams[serial] = shared
+            shared.output.add_subscriber(queue)
+
+        try:
+            pyez_client = await self.async_ensure_logged_in()
+            await shared.ensure_started(pyez_client)
+        except Exception:
+            await self.async_detach_stream(serial, shared, queue)
+            raise
+        return shared, queue
+
+    async def async_detach_stream(
+        self, serial: str, shared: _SharedStream, queue: asyncio.Queue[bytes | None]
+    ) -> None:
+        """Detach a viewer, tearing down the shared stream once nobody is left watching."""
+        shared.output.remove_subscriber(queue)
+        async with self._shared_streams_lock:
+            if shared.output.subscriber_count > 0:
+                return
+            if self._shared_streams.get(serial) is shared:
+                del self._shared_streams[serial]
+        await shared.close()
 
     async def async_get_stream_url(self, entry_id: str, serial: str) -> str:
         """Return a signed URL for this HA instance's own stream view.
@@ -182,31 +220,124 @@ class EzvizClient:
         )
 
 
-class _QueueOutput:
+def _broadcast_put(queue: asyncio.Queue[bytes | None], data: bytes | None) -> None:
+    """Hand one chunk to one subscriber queue, dropping it if that
+    subscriber is too far behind rather than blocking the broadcast."""
+    try:
+        queue.put_nowait(data)
+    except asyncio.QueueFull:
+        pass
+
+
+class _BroadcastOutput:
     """File-like bridge from the sync `copy_cloud_stream_to_mpegts` call
-    (running in an executor thread) to the async HTTP response writing the
-    bytes out to whoever asked for the stream.
+    (running in an executor thread) to however many async viewers are
+    currently watching this serial.
+
+    Subscribers can be added/removed from the event loop thread at any
+    time while `write()` is being called concurrently from the executor
+    thread - the subscriber set is protected accordingly.
     """
 
-    def __init__(self, hass: HomeAssistant, queue: asyncio.Queue[bytes | None]) -> None:
+    def __init__(self, hass: HomeAssistant) -> None:
         self._loop = hass.loop
-        self._queue = queue
+        self._subscribers: set[asyncio.Queue[bytes | None]] = set()
+        self._lock = threading.Lock()
         self._closed = threading.Event()
+
+    def add_subscriber(self, queue: asyncio.Queue[bytes | None]) -> None:
+        with self._lock:
+            self._subscribers.add(queue)
+
+    def remove_subscriber(self, queue: asyncio.Queue[bytes | None]) -> None:
+        with self._lock:
+            self._subscribers.discard(queue)
+
+    @property
+    def subscriber_count(self) -> int:
+        with self._lock:
+            return len(self._subscribers)
 
     def write(self, data: bytes) -> int:
         """Called from the executor thread with each remuxed chunk."""
         if self._closed.is_set():
-            raise BrokenPipeError("EZVIZ stream view: HTTP client disconnected")
-        self._loop.call_soon_threadsafe(self._queue.put_nowait, data)
+            raise BrokenPipeError("EZVIZ stream view: no viewers left")
+        with self._lock:
+            queues = list(self._subscribers)
+        for queue in queues:
+            self._loop.call_soon_threadsafe(_broadcast_put, queue, data)
         return len(data)
 
     def flush(self) -> None:
         """No-op: each write() is already handed off immediately."""
 
     def close(self) -> None:
-        """Signal the executor thread's next write() to stop cleanly."""
+        """Signal every current subscriber's next get() to stop cleanly."""
         self._closed.set()
-        self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
+        with self._lock:
+            queues = list(self._subscribers)
+        for queue in queues:
+            self._loop.call_soon_threadsafe(_broadcast_put, queue, None)
+
+
+class _SharedStream:
+    """One real EZVIZ VTM connection + keep-alive loop, fanned out to every
+    concurrent viewer of one camera serial.
+
+    Started by whichever viewer arrives first while none is running for
+    that serial; reused by every viewer that arrives while it's active;
+    torn down once the last one detaches. This makes it architecturally
+    impossible for two real connections to the same serial to exist at
+    once, which is what the device's single-session limit actually needs -
+    a cleaner fix than the old "first one wins, the rest get a placeholder
+    and give up" approach.
+    """
+
+    def __init__(self, hass: HomeAssistant, serial: str) -> None:
+        self._hass = hass
+        self.serial = serial
+        self.output = _BroadcastOutput(hass)
+        self._start_lock = asyncio.Lock()
+        self._started = False
+        self._copy_job: asyncio.Future[None] | None = None
+        self._keepalive_stop = asyncio.Event()
+        self._keepalive_task: asyncio.Task[None] | None = None
+
+    async def ensure_started(self, pyez_client: Any) -> None:
+        """Start the real EZVIZ connection if not already running.
+
+        Safe to call from multiple concurrently-attaching viewers: only
+        the first one to get here actually starts anything.
+        """
+        async with self._start_lock:
+            if self._started:
+                return
+            self._started = True
+
+            from .vendor.pyezvizapi.cloud_stream import copy_cloud_stream_to_mpegts
+            from .vendor.pyezvizapi.exceptions import PyEzvizError
+
+            def _copy() -> None:
+                try:
+                    copy_cloud_stream_to_mpegts(pyez_client, self.serial, self.output)
+                except (PyEzvizError, OSError):
+                    _LOGGER.exception("EZVIZ stream copy failed for %s", self.serial)
+                finally:
+                    self.output.close()
+
+            self._copy_job = self._hass.async_add_executor_job(_copy)
+            self._keepalive_task = self._hass.async_create_task(
+                _keepalive_loop(self._hass, pyez_client, self.serial, self._keepalive_stop)
+            )
+
+    async def close(self) -> None:
+        """Tear down the real connection. Only called once the last subscriber has left."""
+        self.output.close()
+        self._keepalive_stop.set()
+        if self._copy_job is not None:
+            await self._copy_job
+        if self._keepalive_task is not None:
+            await self._keepalive_task
 
 
 async def _stream_placeholder(
@@ -348,107 +479,61 @@ class EzvizStreamView(HomeAssistantView):
         if client is None:
             return web.Response(status=404, text="Unknown EZVIZ Stream config entry")
 
-        from .vendor.pyezvizapi.cloud_stream import copy_cloud_stream_to_mpegts
-        from .vendor.pyezvizapi.exceptions import PyEzvizError
-
         response = web.StreamResponse(
             status=200, headers={"Content-Type": "video/mp2t"}
         )
         await response.prepare(request)
         _LOGGER.debug("EZVIZ stream %s: response prepared at +%.2fs", serial, time.monotonic() - t0)
 
-        # The device only accepts one active VTM/P2P session at a time, and
-        # go2rtc can open several near-simultaneous connections to this view
-        # while probing/retrying a new source. Only one of them ("owner")
-        # actually attempts the EZVIZ connection; the rest ("followers") just
-        # get the placeholder for a bit and then close, instead of either
-        # fighting the owner for the device's one session slot or queuing
-        # behind it (queuing made things worse: go2rtc's patience per
-        # attempt is only a few seconds, far less than a slow/hung attempt
-        # can take, so everything downstream of a queue timed out anyway).
-        lock = client.stream_lock_for(serial)
-        is_owner = not lock.locked()
-        if is_owner:
-            await lock.acquire()
-
+        # Every viewer sees the placeholder until real bytes reach ITS OWN
+        # queue. For the first viewer of a serial that's the time it takes
+        # to log in and connect; for a viewer joining a stream that's
+        # already flowing, real data typically lands within one broadcast
+        # cycle, so the placeholder is only visible for a moment.
         real_data_ready = asyncio.Event()
         placeholder_task = hass.async_create_task(
-            _stream_placeholder(
-                response,
-                real_data_ready,
-                max_duration=None if is_owner else _FOLLOWER_PLACEHOLDER_MAX_SECONDS,
-            )
+            _stream_placeholder(response, real_data_ready, max_duration=None)
         )
 
-        if not is_owner:
-            _LOGGER.debug(
-                "EZVIZ stream %s: another attempt already in flight, placeholder-only at +%.2fs",
-                serial,
-                time.monotonic() - t0,
-            )
+        try:
+            shared, queue = await client.async_attach_stream(serial)
+        except EzvizAuthError:
+            _LOGGER.exception("EZVIZ stream %s: login failed", serial)
+            real_data_ready.set()
             await placeholder_task
             return response
 
+        _LOGGER.debug("EZVIZ stream %s: attached to shared stream at +%.2fs", serial, time.monotonic() - t0)
+
+        first_chunk = True
         try:
-            try:
-                pyez_client = await client.async_ensure_logged_in()
-            except EzvizAuthError:
-                _LOGGER.exception("EZVIZ stream %s: login failed", serial)
-                return response
-            _LOGGER.debug("EZVIZ stream %s: logged in at +%.2fs", serial, time.monotonic() - t0)
-
-            queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
-            output = _QueueOutput(hass, queue)
-
-            def _copy() -> None:
-                try:
-                    copy_cloud_stream_to_mpegts(pyez_client, serial, output)
-                except (PyEzvizError, OSError):
-                    _LOGGER.exception("EZVIZ stream copy failed for %s", serial)
-                finally:
-                    output.close()
-
-            copy_job = hass.async_add_executor_job(_copy)
-
-            keepalive_stop = asyncio.Event()
-            keepalive_task = hass.async_create_task(
-                _keepalive_loop(hass, pyez_client, serial, keepalive_stop)
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                if first_chunk:
+                    _LOGGER.debug(
+                        "EZVIZ stream %s: first chunk (%d bytes) at +%.2fs",
+                        serial,
+                        len(chunk),
+                        time.monotonic() - t0,
+                    )
+                    first_chunk = False
+                    # Real data is ready: let the placeholder finish its
+                    # current write and stop before we write anything else,
+                    # so the two never interleave on `response`.
+                    real_data_ready.set()
+                    await placeholder_task
+                await response.write(chunk)
+        except (ConnectionResetError, asyncio.CancelledError):
+            _LOGGER.debug(
+                "EZVIZ stream %s: client disconnected at +%.2fs", serial, time.monotonic() - t0
             )
-
-            first_chunk = True
-            try:
-                while True:
-                    chunk = await queue.get()
-                    if chunk is None:
-                        break
-                    if first_chunk:
-                        _LOGGER.debug(
-                            "EZVIZ stream %s: first chunk (%d bytes) at +%.2fs",
-                            serial,
-                            len(chunk),
-                            time.monotonic() - t0,
-                        )
-                        first_chunk = False
-                        # Real data is ready: let the placeholder finish its
-                        # current write and stop before we write anything
-                        # else, so the two never interleave on `response`.
-                        real_data_ready.set()
-                        await placeholder_task
-                    await response.write(chunk)
-            except (ConnectionResetError, asyncio.CancelledError):
-                _LOGGER.debug(
-                    "EZVIZ stream %s: client disconnected at +%.2fs", serial, time.monotonic() - t0
-                )
-            finally:
-                output.close()
-                await copy_job
-                keepalive_stop.set()
-                await keepalive_task
-            _LOGGER.debug("EZVIZ stream %s: copy job finished at +%.2fs", serial, time.monotonic() - t0)
         finally:
             real_data_ready.set()
             if not placeholder_task.done():
                 await placeholder_task
-            lock.release()
+            await client.async_detach_stream(serial, shared, queue)
+            _LOGGER.debug("EZVIZ stream %s: detached at +%.2fs", serial, time.monotonic() - t0)
 
         return response
