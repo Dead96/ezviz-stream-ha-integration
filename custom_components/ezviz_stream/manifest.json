@@ -9,5 +9,5 @@
   "iot_class": "calculated",
   "issue_tracker": "https://github.com/Dead96/ezviz-stream-ha-integration/issues",
   "requirements": ["pycryptodome>=3.19.0", "requests>=2.31.0", "paho-mqtt>=1.6.0", "xmltodict>=0.13.0"],
-  "version": "0.3.2"
+  "version": "0.3.3"
 }

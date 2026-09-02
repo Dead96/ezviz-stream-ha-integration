@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.3] - 2026-09-02
+
+### Fixed
+
+- Real-world logs showed HA's native `stream` component retrying the exact
+  same `stream_source()` signed URL for well over a minute, all failing
+  with HTTP 401 - the previous 5-minute signature expiration had already
+  lapsed by the time it actually tried to use it, which looks like the
+  main reason a "click to watch" could take ~90 seconds. Bumped the
+  expiration to 1 hour; the URL only grants access to our own loopback
+  re-stream endpoint, so a long-lived signature is low-risk.
+
 ## [0.3.2] - 2026-09-02
 
 ### Added

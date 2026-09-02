@@ -40,7 +40,13 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-_SIGNED_URL_EXPIRATION = timedelta(minutes=5)
+# Real-world logs showed HA's native `stream` component holding onto a
+# `stream_source()` URL and retrying that exact same signed URL for well
+# over a minute before giving up - all getting HTTP 401 because our
+# previous 5-minute expiration had already lapsed by the time it was
+# actually used. The URL only grants access to our own loopback re-stream
+# endpoint (no real secret behind it), so a long expiration is low-risk.
+_SIGNED_URL_EXPIRATION = timedelta(hours=1)
 
 # Placeholder video shown while the real EZVIZ VTM connection (which can
 # take anywhere from a few seconds to over a minute - this looks like
