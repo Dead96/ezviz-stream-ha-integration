@@ -62,6 +62,14 @@ _PLACEHOLDER_FPS = "2"
 # shared upstream or the other viewers.
 _SUBSCRIBER_QUEUE_SIZE = 64
 
+# How often an idle viewer (nothing new to write) re-checks whether its
+# HTTP connection is still alive. A write() to an already-closed socket can
+# still succeed once before the OS surfaces the error, so relying on it
+# alone let disconnected viewers (real ones, and go2rtc's own probe
+# connections) keep the shared stream - and the real EZVIZ session behind
+# it - open indefinitely with nobody actually watching.
+_DISCONNECT_POLL_SECONDS = 5.0
+
 # The device closes the VTM stream after a fixed watch duration (~60s
 # observed) unless renewed - a battery-saving measure the official app
 # presumably works around with a "keep watching?" prompt. `delay_battery_
@@ -340,8 +348,24 @@ class _SharedStream:
             await self._keepalive_task
 
 
+def _client_disconnected(request: web.Request) -> bool:
+    """Check the TCP transport directly instead of relying on `write()` to
+    eventually raise.
+
+    A `write()` to a socket whose peer already closed the connection can
+    still succeed (the OS accepts it into the send buffer; the error only
+    surfaces on a later write, sometimes much later). aiohttp's protocol
+    keeps monitoring the read side of the connection independently of our
+    writes, so `transport.is_closing()` notices a dropped client quickly
+    even while we're only ever writing to it.
+    """
+    transport = request.transport
+    return transport is None or transport.is_closing()
+
+
 async def _stream_placeholder(
     response: web.StreamResponse,
+    request: web.Request,
     stop_event: asyncio.Event,
     max_duration: float | None = None,
 ) -> None:
@@ -390,6 +414,8 @@ async def _stream_placeholder(
         assert process.stdout is not None
         while not stop_event.is_set():
             if deadline is not None and time.monotonic() >= deadline:
+                break
+            if _client_disconnected(request):
                 break
             try:
                 chunk = await asyncio.wait_for(process.stdout.read(32768), timeout=0.5)
@@ -492,7 +518,7 @@ class EzvizStreamView(HomeAssistantView):
         # cycle, so the placeholder is only visible for a moment.
         real_data_ready = asyncio.Event()
         placeholder_task = hass.async_create_task(
-            _stream_placeholder(response, real_data_ready, max_duration=None)
+            _stream_placeholder(response, request, real_data_ready, max_duration=None)
         )
 
         try:
@@ -508,7 +534,22 @@ class EzvizStreamView(HomeAssistantView):
         first_chunk = True
         try:
             while True:
-                chunk = await queue.get()
+                # A dead viewer (e.g. one of go2rtc's own probe connections
+                # that never sends a clean close) must not keep the shared
+                # stream - and the real EZVIZ connection behind it - alive
+                # forever. Poll the queue instead of awaiting it forever, so
+                # we get a regular chance to check the transport directly.
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=_DISCONNECT_POLL_SECONDS)
+                except TimeoutError:
+                    if _client_disconnected(request):
+                        _LOGGER.debug(
+                            "EZVIZ stream %s: transport closed while idle at +%.2fs",
+                            serial,
+                            time.monotonic() - t0,
+                        )
+                        break
+                    continue
                 if chunk is None:
                     break
                 if first_chunk:

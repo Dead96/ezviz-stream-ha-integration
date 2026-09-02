@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.1] - 2026-09-02
+
+### Fixed
+
+- 0.4.0's fan-out let the real EZVIZ connection (and its keep-alive calls)
+  run indefinitely even after nobody was actually watching. Root cause:
+  each viewer's cleanup relied on `response.write()` eventually raising to
+  detect a disconnected client, but a `write()` to an already-closed
+  socket can still succeed once before the OS surfaces the error - so a
+  viewer whose connection died without a clean close (observed with some
+  of go2rtc's own probe connections) kept counting as an active
+  subscriber forever, which kept the shared stream (and the battery drain
+  behind it) alive with no real viewer left.
+- Every viewer (including the placeholder-only phase) now also polls the
+  HTTP transport directly (`transport.is_closing()`) every few seconds,
+  independent of whether a write has been attempted. This catches dead
+  connections aiohttp already knows about internally but that our
+  write-based detection was missing.
+
 ## [0.4.0] - 2026-09-02
 
 ### Changed
